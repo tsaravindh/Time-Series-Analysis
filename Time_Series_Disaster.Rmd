@@ -1,0 +1,594 @@
+---
+title: "Final"
+output:
+  word_document: default
+  html_document: default
+date: "2025-03-21"
+---
+
+# 1. LOAD LIBRARIES
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(fpp2)
+library(TSA)
+library(tseries)
+library(moments)
+library(naniar)
+library(vars)
+library(zoo)
+library(urca)
+library(ggplot2)
+```
+
+# 2. DATA IMPORT & CLEANING
+
+```{r}
+disaster_data <- read.csv("disaster-events.csv", stringsAsFactors = FALSE) %>%
+  mutate(Year = as.numeric(Year)) %>%
+  filter(!is.na(Year))
+
+raw_lines <- readLines("GlobalWarming.txt")
+global_temp <- read.table(text = raw_lines[!grepl("^[-]+$", raw_lines)], header = TRUE, fill = TRUE, stringsAsFactors = FALSE)
+colnames(global_temp) <- c("Year", "No_Smoothing", "Lowess", "Remove")
+
+global_temp <- global_temp %>% 
+  dplyr::select(Year, No_Smoothing, Lowess) %>% 
+  filter(!is.na(Year) & grepl("^[0-9]+$", Year)) %>% 
+  mutate(across(everything(), as.numeric)) %>% 
+  filter(Year >= 1900)
+
+# Merge and interpolate
+d <- left_join(disaster_data, global_temp, by = "Year") %>%
+  group_by(Entity) %>%
+  mutate(No_Smoothing = na.approx(No_Smoothing, na.rm = FALSE)) %>%
+  ungroup()
+
+# Drop the most recent year
+d <- d %>% filter(Year < max(d$Year, na.rm = TRUE))
+head(d)
+```
+
+# 3. EXPLORATORY DATA ANALYSIS
+
+```{r}
+# Summary Stats
+summary_stats <- d %>% group_by(Entity) %>% summarise(mean = mean(Disasters), sd = sd(Disasters), n = n())
+print(summary_stats)
+```
+
+```{r}
+# Line Plot
+p1 <- ggplot(d, aes(x = Year, y = Disasters, color = Entity)) +
+  geom_line() + theme_minimal() + ggtitle("Trends of Disaster Types")
+print(p1)
+```
+- This line graph visualizes the number of disasters over time.
+- A sharp increase in disaster occurrences is noticeable from the 1970s onwards.
+
+```{r}
+# Log-Scaled
+p2 <- ggplot(d, aes(x = Year, y = log(Disasters), color = Entity)) +
+  geom_line() + theme_minimal() + ggtitle("Log Scaled Disaster Trends")
+print(p2)
+```
+- This plot is a log-transformed version of the previous disaster trend graph.
+- Log transformation is used to reduce the impact of extreme values and better visualize smaller-scale disaster trends.
+- It helps in identifying underlying trends without dominance from high-frequency disaster types.
+- Log transformation suggests non-linear disaster growth.
+
+```{r}
+# Heatmap
+p3 <- ggplot(d, aes(x = Year, y = Entity, fill = Disasters)) +
+  geom_tile() + theme_minimal() + ggtitle("Disaster Frequency Heatmap")
+print(p3)
+```
+- This heatmap represents the frequency of different types of disasters over time.
+- Lighter shades indicate higher disaster occurrences in that period.
+- It highlights when different disaster types started becoming more common.
+
+# 4. TIME SERIES TRANSFORMATION
+
+```{r}
+all_disasters <- d %>% filter(Entity == "All disasters")
+dat_ts <- ts(all_disasters$Disasters, start = min(all_disasters$Year), frequency = 1)
+
+hist(dat_ts, main = "Original Histogram")
+```
+- A histogram of disaster count data showing an uneven distribution with a right-skewed tail.
+- Most disaster counts are low, with some high-frequency disaster occurrences causing skewness.
+- The skewed nature suggests the need for transformation before applying time series models.
+
+```{r}
+log_ts <- log(dat_ts)
+hist(log_ts, main = "Log-transformed Histogram")
+```
+- The histogram after applying a log transformation to normalize the disaster count data.
+- The transformed data appear more normally distributed, reducing skewness.
+- This transformation is useful for stabilizing variance in forecasting models.
+
+```{r}
+cat("Skewness:", skewness(dat_ts), "\n")
+cat("Log Skewness:", skewness(log_ts), "\n")
+
+```
+- Skewness of the original data (0.94) indicates a right-skewed distribution.
+- After log transformation, skewness (-0.11) is closer to zero, indicating normalization.
+
+```{r}
+lambda <- BoxCox.lambda(dat_ts)
+bc_ts <- BoxCox(dat_ts, lambda)
+cat("BoxCox Lambda:", lambda, "\n")
+```
+- Box-Cox transformation parameter (0.446) further supports the need for data transformation.
+- Applied log and Box-Cox transformations helps to reduce the skewness.
+
+```{r}
+# Differencing
+diff_ts <- diff(log_ts, differences = 1)
+plot(diff_ts, main = "Log-Differenced Series", col = "blue")
+
+```
+- Differencing removed trend components and improved stationarity for time series modeling.
+- This process helps in making the series stationary, which is crucial for ARIMA modeling.
+- The fluctuations stabilize over time, suggesting stationarity improvement.
+
+
+# 5. STATIONARITY CHECK
+
+```{r}
+adf.test(diff_ts)
+kpss.test(diff_ts)
+```
+- Augmented Dickey-Fuller (ADF) test confirms stationarity with a significant p-value (< 0.01).
+- KPSS test result (p-value > 0.1) also supports stationarity.
+- The differencing and transformation steps successfully converted the time series to a stationary form, making it suitable for forecasting models.
+
+```{r}
+acf(diff_ts)
+```
+- The Autocorrelation Function (ACF) plot for the differenced log-transformed series shows correlation at various lags.
+- Significant spikes at lag 1 suggest the presence of MA (Moving Average) components.
+- The quick drop-off confirms that differencing helped achieve stationarity.
+
+```{r}
+pacf(diff_ts)
+```
+- The Partial Autocorrelation Function (PACF) plot reveals significant spikes at initial lags, particularly lag 1 and 2.
+- This indicates the presence of AR (Auto-Regressive) components.
+- Combined with ACF, this plot aids in selecting ARIMA model parameters.
+
+```{r}
+eacf(diff_ts)
+```
+
+```{r}
+# 6. MODEL SELECTION
+Fit1 <- Arima(diff_ts, order = c(2,1,0))
+Fit2 <- Arima(diff_ts, order = c(0,1,2))
+Fit3 <- Arima(diff_ts, order = c(2,1,2))
+
+compare_models <- data.frame(
+  Model = c("ARIMA(2,1,0)", "ARIMA(0,1,2)", "ARIMA(2,1,2)"),
+  AIC = c(AIC(Fit1), AIC(Fit2), AIC(Fit3)),
+  BIC = c(BIC(Fit1), BIC(Fit2), BIC(Fit3))
+)
+print(compare_models)
+```
+- The model ARIMA(2,1,2) has the lowest AIC and BIC, suggesting the best fit among the tested models.
+- Lower values indicate better model performance.
+
+```{r}
+# Diagnostics
+best_model <- Fit3
+checkresiduals(best_model)
+```
+- Residuals are mostly centered around zero and resemble white noise.
+- However, the Ljung-Box test (p = 0.004) indicates that residuals are not completely random, suggesting slight model misspecification.
+
+```{r}
+# Auto ARIMA
+best_auto_model <- auto.arima(diff_ts)
+checkresiduals(best_auto_model)
+```
+- Auto ARIMA selected ARIMA(0,0,1) as the best model based on internal criteria.
+- Ljung-Box test p = 0.11 implies that residuals are uncorrelated and resemble white noise.
+- Suggests a statistically adequate model with minimal manual tuning.
+- Residual plot shows stabilization around zero and ACF plot confirms absence of strong autocorrelation.
+- Histogram appears approximately normal, supporting model adequacy.
+
+```{r}
+# SARIMA
+sarima <- auto.arima(dat_ts, seasonal = TRUE)
+summary(sarima)
+```
+- AIC = 1142.47, BIC = 1150.91 suggest decent model fit.
+- Drift term indicates a long-term increasing trend in disaster count.
+
+```{r}
+checkresiduals(sarima)
+
+```
+- Ljung-Box test p = 0.013 shows some autocorrelation remains in residuals.
+- Indicates potential model improvement needed or that residuals may not be pure white noise.
+- Residuals are more spread out compared to earlier models and ACF plot shows minor lags crossing significance bounds.
+- Histogram shows a slight right skew, suggesting residuals deviate from normality.
+
+```{r}
+AIC(best_auto_model)
+AIC(best_model)  # Existing ARIMA model
+AIC(sarima)
+```
+- Auto ARIMA has the lowest AIC (139.26), followed by the manual ARIMA(2,1,2) model (144.89), and SARIMA (1142.48), indicating Auto ARIMA is a good fit followed by manual Arima.
+
+
+```{r}
+accuracy(best_auto_model)
+accuracy(best_model)
+accuracy(sarima)
+```
+- Accuracy metrics (RMSE, MAE, MAPE) show manual ARIMA performs better, especially in terms of RMSE (0.40) and MAE (0.26), reinforcing its selection as the most accurate model.
+
+# 7. CROSS-VALIDATION
+
+```{r}
+filtered <- d %>% 
+  filter(Entity == "All disasters") %>% 
+  dplyr::select(Year, Disasters, No_Smoothing)
+filtered$No_Smoothing <- na.approx(filtered$No_Smoothing)
+
+# Check cross-correlation to see if temperature leads disasters
+ccf(filtered$No_Smoothing, filtered$Disasters, main = "CCF: Temp Anomalies vs Disaster Counts")
+
+```
+- CCF plot shows strong positive correlation around lag 0, indicating that temperature anomalies and disaster counts move together contemporaneously.
+- This suggests potential for an ARIMAX model, using temperature as an external regressor.
+
+```{r}
+# Now perform cross-validation with non-overlapping windows
+k <- 5; horizon <- 3
+errors <- matrix(NA, k, 2)
+colnames(errors) <- c("ARIMA", "ARIMAX")
+
+# Define test windows properly
+total_rows <- nrow(filtered)
+segment_size <- floor(total_rows / (k + 1))  # Reserve one segment for final validation
+
+for (i in 1:k) {
+  # Non-overlapping windows
+  train_end <- i * segment_size
+  test_start <- train_end + 1
+  test_end <- min(test_start + horizon - 1, total_rows)
+  
+  train <- filtered[1:train_end, ]
+  test <- filtered[test_start:test_end, ]
+  
+  # Fit models
+  model_arima <- auto.arima(train$Disasters, seasonal = FALSE)
+  model_arimax <- auto.arima(train$Disasters, xreg = train$No_Smoothing, seasonal = FALSE)
+  
+  # Generate forecasts
+  forecast_arima <- forecast(model_arima, h = horizon)
+  forecast_arimax <- forecast(model_arimax, xreg = test$No_Smoothing, h = horizon)
+  
+  # Calculate errors (using MAE)
+  errors[i, 1] <- mean(abs(test$Disasters - forecast_arima$mean))
+  errors[i, 2] <- mean(abs(test$Disasters - forecast_arimax$mean))
+}
+
+# Summarize cross-validation results
+print(colMeans(errors))
+print(apply(errors, 2, sd))
+```
+- Mean and standard deviation of errors from cross-validation show ARIMAX has slightly better RMSE (24.73) than ARIMA (29.88).
+- Incorporating temperature improves predictive performance slightly.
+
+```{r}
+# Train final models on all data for diagnostics
+arimax_final <- auto.arima(filtered$Disasters, xreg = filtered$No_Smoothing, seasonal = FALSE)
+arima_final <- auto.arima(filtered$Disasters, seasonal = FALSE)
+# Diagnostic checks on final model
+checkresiduals(arimax_final)
+```
+
+```{r}
+# Formal tests
+ljung <- Box.test(residuals(arimax_final), lag = 20, type = "Ljung-Box")
+cat("Ljung-Box p-value:", ljung$p.value, "\n")
+
+jb <- jarque.bera.test(residuals(arimax_final))
+cat("Jarque-Bera p-value:", jb$p.value, "\n")
+```
+- Fitted model: ARIMA(1,1,0) with temperature as a regressor.
+- Residuals show minor autocorrelation (Ljung-Box p = 0.0235), implying residuals are not entirely white noise.
+- Jarque-Bera p = 0 indicates non-normality in residuals.
+
+# 8. FINAL FORECAST
+
+```{r}
+# Set up forecast parameters
+future_years <- seq(max(d$Year) + 1, max(d$Year) + 10, 1)  # Forecasting 10 years ahead
+h <- length(future_years)  # Define forecast horizon
+
+# Prepare historical data for the model
+all_disasters <- d %>% filter(Entity == "All disasters")
+dat_ts <- ts(all_disasters$Disasters, start = min(all_disasters$Year), frequency = 1)
+xreg_past <- as.matrix(all_disasters$No_Smoothing)
+
+# Fit the final ARIMAX model using all available data
+arimax_final <- auto.arima(dat_ts, xreg = xreg_past)
+summary(arimax_final)
+
+
+```
+- Significant xreg coefficient (42.32) confirms temperature anomalies influence disaster counts.
+- Error metrics (RMSE = 24.00, MAE = 15.83) are slightly better than SARIMA, but not dramatically.
+
+```{r}
+temp_ts <- ts(all_disasters$No_Smoothing, start = min(all_disasters$Year), frequency = 1)
+temp_model <- auto.arima(temp_ts)
+temp_forecast <- forecast(temp_model, h = h)
+xreg_future <- as.matrix(temp_forecast$mean)
+
+# Generate the ARIMAX forecast
+forecast_arimax <- forecast(arimax_final, xreg = xreg_future, h = h)
+
+# Convert forecast to data frame for visualization
+forecast_df <- data.frame(
+  Year = future_years, 
+  Predicted = as.numeric(forecast_arimax$mean),
+  Lower_PI = as.numeric(forecast_arimax$lower[,2]),  # 95% prediction interval
+  Upper_PI = as.numeric(forecast_arimax$upper[,2])   # 95% prediction interval
+)
+
+# Visualize the forecast
+ggplot() +
+  geom_line(data = all_disasters, aes(x = Year, y = Disasters), color = "black") +
+  geom_line(data = forecast_df, aes(x = Year, y = Predicted), color = "blue") +
+  geom_ribbon(data = forecast_df, aes(x = Year, y = Predicted, ymin = Lower_PI, ymax = Upper_PI), 
+              fill = "blue", alpha = 0.2) +
+  labs(title = "Disaster Forecast with ARIMAX Model", 
+       subtitle = "With 95% prediction intervals",
+       x = "Year", y = "Number of Disasters") +
+  theme_minimal()
+
+```
+- The forecast shows a gradual increase in disaster counts with 95% prediction intervals.
+- The model expects disaster counts to continue rising in the coming years.
+
+```{r}
+log_disasters_diff <- diff(log(filtered$Disasters))
+log_temp_diff <- diff(log(filtered$No_Smoothing + abs(min(filtered$No_Smoothing)) + 0.01))
+
+# Combine and remove NA
+combined_var <- na.omit(cbind(Disasters = log_disasters_diff, Temperature = log_temp_diff))
+
+# Select optimal lag using information criteria
+lag_selection <- VARselect(combined_var, lag.max = 10, type = "both")
+print(lag_selection$selection)
+
+# Fit VAR model with optimal lag
+var_model <- VAR(combined_var, p = lag_selection$selection["AIC(n)"], type = "both")
+summary(var_model)
+```
+- Lag order = 7 selected based on AIC, HQ, FPE.
+- Several lags of temperature significantly influence disasters (e.g., lags 1, 2, 3, 6).
+- r squared = 0.48 for disaster equation, indicating moderate explanatory power.
+- Residual correlation between disaster and temperature = -0.276, suggesting inverse fluctuations at times.
+
+
+```{r}
+# Generate VAR forecasts
+var_forecast <- predict(var_model, n.ahead = h)
+var_forecast
+```
+- Table shows point forecasts with lower and upper bounds for both disaster and temperature series.
+- Helps understand the forecast uncertainty and range for each future time point.
+
+```{r}
+# Start with the last observed values
+last_log_disasters <- log(tail(filtered$Disasters, 1))
+last_log_temp <- log(tail(filtered$No_Smoothing + abs(min(filtered$No_Smoothing)) + 0.01, 1))
+
+# Initialize vectors to store the back-transformed forecasts
+var_disasters_forecast <- numeric(h)
+var_temp_forecast <- numeric(h)
+
+# Recursively apply the differences to get back to log scale
+for (i in 1:h) {
+  if (i == 1) {
+    var_disasters_forecast[i] <- last_log_disasters + var_forecast$fcst$Disasters[i, 1]
+    var_temp_forecast[i] <- last_log_temp + var_forecast$fcst$Temperature[i, 1]
+  } else {
+    var_disasters_forecast[i] <- var_disasters_forecast[i-1] + var_forecast$fcst$Disasters[i, 1]
+    var_temp_forecast[i] <- var_temp_forecast[i-1] + var_forecast$fcst$Temperature[i, 1]
+  }
+}
+```
+
+
+```{r}
+# Convert from log scale to original scale
+var_disasters_forecast <- exp(var_disasters_forecast) - 1
+var_disasters_forecast[var_disasters_forecast < 0] <- 0
+var_temp_forecast <- exp(var_temp_forecast) - abs(min(filtered$No_Smoothing)) - 0.01
+
+# Create a data frame with both forecasts
+comparison_df <- data.frame(
+  Year = future_years,
+  ARIMAX_Forecast = forecast_df$Predicted,
+  ARIMAX_Lower = forecast_df$Lower_PI,
+  ARIMAX_Upper = forecast_df$Upper_PI,
+  VAR_Forecast = var_disasters_forecast
+)
+comparison_df <- left_join(comparison_df, filtered %>% dplyr::select(Year, Disasters), by = "Year")
+
+# Calculate VAR forecast intervals using proportional width from ARIMAX
+# Ensure prediction intervals are reasonable
+arimax_width_ratio <- (forecast_df$Upper_PI - forecast_df$Lower_PI) / abs(forecast_df$Predicted + 1e-10)  # Avoid division by zero
+interval_factor <- min(1, mean(arimax_width_ratio, na.rm = TRUE)/2)  # Avoid extreme scaling
+
+comparison_df$VAR_Lower <- pmax(0, var_disasters_forecast * (1 - interval_factor))  # Keep lower bound >= 0
+comparison_df$VAR_Upper <- var_disasters_forecast * (1 + interval_factor)
+
+
+```
+
+# Create a visualization comparing both forecasts
+
+```{r}
+ggplot(data = comparison_df, aes(x = Year)) + 
+  geom_line(aes(y = Disasters), color = "black", size = 1) +  # Historical Data
+  
+  # ARIMAX forecast
+  geom_line(aes(y = ARIMAX_Forecast, color = "ARIMAX"), size = 1) +
+  geom_ribbon(aes(ymin = ARIMAX_Lower, ymax = ARIMAX_Upper, fill = "ARIMAX"), alpha = 0.2) +
+  
+  # VAR forecast
+  geom_line(aes(y = VAR_Forecast, color = "VAR"), size = 1) +
+  geom_ribbon(aes(ymin = VAR_Lower, ymax = VAR_Upper, fill = "VAR"), alpha = 0.2) +
+  
+  # Add labels and theme
+  labs(title = "Comparison of Disaster Forecasts", 
+       subtitle = "ARIMAX vs VAR model predictions with 95% intervals",
+       x = "Year", 
+       y = "Number of Disasters",
+       color = "Model Type",
+       fill = "Prediction Interval") +
+  
+  # Define colors
+  scale_color_manual(values = c("ARIMAX" = "blue", "VAR" = "red")) +
+  scale_fill_manual(values = c("ARIMAX" = "blue", "VAR" = "red")) +
+  
+  # Apply theme
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+
+```
+- VAR model forecasts significantly higher future disaster counts than ARIMAX.
+- ARIMAX is more conservative with tighter confidence intervals; VAR has wider intervals and upward trend.
+
+```{r}
+# Calculate forecast accuracy metrics for comparison
+last_actual_years <- tail(filtered, h)
+arimax_forecast_subset <- head(forecast_arimax$mean, nrow(last_actual_years))
+```
+
+```{r}
+# Only compare if we have actual data for comparison
+if(nrow(last_actual_years) > 0) {
+  # RMSE
+  arimax_rmse <- sqrt(mean((last_actual_years$Disasters - arimax_forecast_subset)^2, na.rm = TRUE))
+  
+  # MAE
+  arimax_mae <- mean(abs(last_actual_years$Disasters - arimax_forecast_subset), na.rm = TRUE)
+  
+  # MAPE
+  arimax_mape <- mean(abs((last_actual_years$Disasters - arimax_forecast_subset)/last_actual_years$Disasters), 
+                     na.rm = TRUE) * 100
+  
+  # Print comparison metrics
+  cat("ARIMAX Forecast Accuracy Metrics:\n")
+  cat("RMSE:", arimax_rmse, "\n")
+  cat("MAE:", arimax_mae, "\n")
+  cat("MAPE:", arimax_mape, "%\n\n")
+  
+  # We could do the same for VAR if we had enough historical data to reserve
+}
+```
+
+```{r}
+# Output a table of forecasts for reference
+print(comparison_df)
+```
+- Tabular comparison of ARIMAX and VAR forecasts (2024–2033).
+- ARIMAX predicts 425–448 disasters, while VAR predicts a sharper increase to 609 by 2033.
+- Helps contrast how different model types interpret the relationship between temperature and disasters.
+
+```{r}
+# Create a forecast difference analysis
+comparison_df$Forecast_Difference <- comparison_df$VAR_Forecast - comparison_df$ARIMAX_Forecast
+comparison_df$Percentage_Difference <- (comparison_df$Forecast_Difference / comparison_df$ARIMAX_Forecast) * 100
+
+# Plot the differences
+ggplot(comparison_df, aes(x = Year, y = Percentage_Difference)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Percentage Difference Between VAR and ARIMAX Forecasts",
+       subtitle = "Positive values indicate VAR predicts higher disaster counts",
+       x = "Year", 
+       y = "Percentage Difference (%)") +
+  theme_minimal()
+```
+- This bar chart compares the forecasted disaster counts from the VAR model and the ARIMAX model for the years 2024 to 2033.
+- Positive values indicate that the VAR model predicts more disasters than the ARIMAX model.
+- The gap widens over time, starting around 5–12% in 2024–2025 and growing to over 35% by 2033.
+- This suggests that the VAR model anticipates a steeper increase in disaster frequency, possibly due to stronger interactions or feedback effects between temperature anomalies and disaster counts.
+- To assess and forecast global disaster trends, multiple time series models were evaluated — ARIMA, ARIMAX (with temperature anomalies as exogenous variables), and VAR (a multivariate approach including both disaster counts and temperature). Among these, the ARIMAX model demonstrated the best balance of statistical performance and interpretability, showing lower RMSE (24.00), MAE (15.83), and MAPE (42.07%) compared to SARIMA. Diagnostic tests confirmed a reasonable model fit, although some residual autocorrelation and non-normality were observed.
+- Forecasts from the ARIMAX model predict a steady rise in disaster counts over the next decade. However, forecasts from the VAR model consistently predict higher disaster counts — with a growing percentage difference reaching over 35% by 2033. This divergence, visualized through a percentage difference bar chart, suggests the VAR model captures stronger lagged effects and interdependencies between temperature and disaster occurrences.
+- In summary, while ARIMAX provides a more conservative and statistically robust fit, the VAR model signals a more alarming future trajectory. These differences underscore the importance of model choice in climate-related forecasting and the potential need to integrate complex system dynamics in future analyses.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
